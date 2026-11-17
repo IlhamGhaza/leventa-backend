@@ -1,0 +1,887 @@
+openapi: 3.0.3
+info:
+  title: Property Management System API
+  version: 1.0.0
+  description: |
+    Internal property listing backend. Roles: `sales` (Marketing) and `admin`. Customers are guests without an account: they use only the public (unauthenticated) property endpoints and contact Marketing through WhatsApp.
+
+    **Privacy contract**
+    - Owner PII is served only by `GET /properties/{id}/owner` to the *primary marketing* of that listing.
+    - Exact address (block, cluster, street, house, floor, room) and coordinates are returned only to the
+      primary marketing and to co-listing marketing of that listing (same view, `access_level` tells which).
+    - Other marketing, admin and guests never receive them; nobody except the primary marketing ever receives owner data.
+    - Admin records the outcome of a property (`POST /properties/{id}/deal` or `/cancel`) and manages co-listing; Admin never edits listings.
+    - The representing marketing user's WhatsApp contact (`contact`) is public; the owner's number never is.
+    - Identity and role always come from the verified bearer token, never from request bodies.
+
+    **Rate limits** (per IP): every request 300/min (`API_RATE_LIMIT_*`), login/refresh 5/min, uploads 30/min.
+    Exceeding a limit returns 429 with a `Retry-After` header. Every response carries `X-Request-ID`.
+
+    **Error envelope**: `{ "success": false, "message": "...", "errors": [...] }`.
+    Unauthorized access to an existing, visible resource returns 403; resources hidden from the caller
+    (draft/archived listings, another marketing's deal or commission) return 404.
+servers:
+  - url: /api/v1
+tags:
+  - name: Auth
+  - name: Properties
+  - name: Owner
+  - name: Documents
+  - name: Co-listing
+  - name: Deals
+  - name: Commissions
+  - name: Users
+  - name: Audit
+  - name: Master data
+security:
+  - bearerAuth: []
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Universal login (email + password only; the backend returns the role)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200': { description: Access and refresh tokens plus user profile }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { description: 'Too many requests from this IP, or the account is locked after repeated failed logins (MAX_LOGIN_ATTEMPTS / LOCKOUT_MINUTES)' }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Rotate the refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties: { refresh_token: { type: string } }
+      responses:
+        '200': { description: New token pair; the old refresh token is revoked }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the refresh token
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user profile
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Auth]
+      summary: Update own WhatsApp number (self-service, D-033)
+      description: >-
+        Changes only the caller's own `whatsapp_number` (the public Marketing contact).
+        The user comes from the token. An empty string clears the number. Numbers are
+        normalized to the 62... format; an invalid number returns 422. Audited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [whatsapp_number]
+              properties:
+                whatsapp_number: { type: string, example: '0812-3456-7890' }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '400': { description: Invalid request body }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  /properties:
+    get:
+      tags: [Properties]
+      security: [{}, { bearerAuth: [] }]
+      summary: Search listings (public for guests; role-scoped for Marketing/Admin)
+      description: |
+        Guests and marketing without a relationship to a listing receive only `available`/`reserved` listings; `status` is ignored for them.
+        `history=true` returns the sold/rented historical section (never mixed with available listings).
+        `(page-1)*limit` must not exceed 10000 and at most 20 `facility_ids` are accepted (422 otherwise).
+        Admin may filter by any `status`. Marketing may use `scope=mine` or `scope=co_listing`. `archived` (cancelled) listings are
+        excluded from every list unless `status=archived` is requested explicitly by Admin or Marketing.
+        List items never contain owner data, exact address or coordinates.
+      parameters:
+        - { name: search, in: query, schema: { type: string, maxLength: 100 }, description: Matches name, code, general location only }
+        - { name: type, in: query, schema: { type: string, enum: [house, apartment, shop_house, factory] } }
+        - { name: transaction_type, in: query, schema: { type: string, enum: [sale, rent] } }
+        - { name: status, in: query, schema: { type: string }, description: Internal roles only }
+        - { name: scope, in: query, schema: { type: string, enum: [mine, co_listing] }, description: Marketing only }
+        - { name: history, in: query, schema: { type: boolean }, description: Only the historical (sold/rented) section }
+        - { name: include_history, in: query, schema: { type: boolean }, description: Available AND historical listings in one list; use `is_available` / `status_badge` per item }
+        - { name: facility_ids, in: query, schema: { type: string }, description: Comma-separated facility UUIDs; a listing must have ALL of them }
+        - { name: province_id, in: query, schema: { type: string, format: uuid } }
+        - { name: city_id, in: query, schema: { type: string, format: uuid } }
+        - { name: district_id, in: query, schema: { type: string, format: uuid } }
+        - { name: min_price, in: query, schema: { type: number } }
+        - { name: max_price, in: query, schema: { type: number } }
+        - { name: min_land_area, in: query, schema: { type: number } }
+        - { name: max_land_area, in: query, schema: { type: number } }
+        - { name: min_building_area, in: query, schema: { type: number } }
+        - { name: max_building_area, in: query, schema: { type: number } }
+        - { name: bedrooms, in: query, schema: { type: integer } }
+        - { name: bathrooms, in: query, schema: { type: integer } }
+        - { name: sort, in: query, schema: { type: string, enum: [newest, oldest, price_asc, price_desc, name_asc, name_desc] } }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: Paginated public projection
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PublicProperty' }
+                  meta: { $ref: '#/components/schemas/Pagination' }
+        '400': { description: Malformed query parameter }
+        '422': { $ref: '#/components/responses/Validation' }
+    post:
+      tags: [Properties]
+      summary: Create a listing (Marketing only; actor becomes primary owner)
+      description: '`primary_marketing_id` and `owner_id` are not accepted. The owner is created from the nested `owner` object.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProperty' }
+      responses:
+        '201':
+          description: Primary projection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PrimaryProperty' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /properties/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Properties]
+      security: [{}, { bearerAuth: [] }]
+      summary: Property detail (projection depends on the caller)
+      description: |
+        - primary marketing and co-listing marketing → `PrimaryProperty` (restricted address, coordinates, team; no owner data)
+        - admin → `InternalProperty` (no restricted data, no owner data)
+        - everyone else → `PublicProperty` (404 for draft/maintenance/archived)
+        `contact.whatsapp_url` is public and always uses the representing marketing user's number.
+      responses:
+        '200':
+          description: One of the three projections
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/PublicProperty'
+                  - $ref: '#/components/schemas/InternalProperty'
+                  - $ref: '#/components/schemas/PrimaryProperty'
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Properties]
+      summary: Partial update (primary marketing only)
+      description: '`PUT` is kept as an alias. Code, owner and primary marketing cannot be changed.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProperty' }
+      responses:
+        '200': { description: Primary projection }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+    delete:
+      tags: [Properties]
+      summary: Delete (primary marketing only); archives instead when the property has a deal
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /properties/{id}/status:
+    put:
+      tags: [Properties]
+      summary: Set status manually (primary marketing; co-listing marketing limited)
+      description: |
+        Primary: draft, available, reserved, maintenance, archived. Co-listing marketing: only available, reserved,
+        maintenance, and never on a draft/archived listing. `sold` and `rented` are set only when Admin records a deal.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [draft, available, reserved, maintenance, archived] }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /properties/{id}/images:
+    post:
+      tags: [Properties]
+      summary: Upload image (primary marketing only; type sniffed, size limited)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+      responses:
+        '201': { $ref: '#/components/responses/Created' }
+        '400': { description: Unsupported type or too large }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /properties/{id}/images/{imageId}:
+    delete:
+      tags: [Properties]
+      summary: Delete image (primary marketing only)
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: imageId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /properties/{id}/images/{imageId}/thumbnail:
+    put:
+      tags: [Properties]
+      summary: Set cover photo (primary marketing only)
+      description: >
+        Makes this image the only thumbnail (is_thumbnail=true) and copies its URL into the
+        property's `thumbnail`. The first uploaded image becomes the cover automatically;
+        deleting the cover promotes the next image, or clears `thumbnail` when none is left.
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: imageId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /properties/{id}/documents:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Documents]
+      summary: List ownership documents (primary and co-listing marketing only)
+      description: Metadata only; file paths are never returned. Admin, other marketing and guests get 403/401.
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Documents]
+      summary: Upload (or replace) an ownership document (primary marketing only)
+      description: |
+        Allowed only while the matching `cert_*` flag of the property is `true`, and only for document types that apply
+        to the property type (house: shm, hgb, imb, pbb, girik, other; apartment: shmsrs, hgb, imb, pbb, slf, other;
+        shop_house: shm, hgb, imb, pbb, slf, other; factory: shm, hgb, hgu, imb, pbb, slf, other). PDF, JPEG or PNG
+        (sniffed from content), at most `UPLOAD_MAX_SIZE`. One document per type: uploading again replaces it.
+        Files are stored privately and are not reachable under `/uploads`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [doc_type, file]
+              properties:
+                doc_type: { type: string, enum: [shm, hgb, hgu, shmsrs, imb, pbb, girik, slf, other] }
+                file: { type: string, format: binary }
+      responses:
+        '201': { $ref: '#/components/responses/Created' }
+        '400': { description: Missing file or unsupported file type }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /properties/{id}/documents/{docId}/download:
+    get:
+      tags: [Documents]
+      summary: Download an ownership document (primary and co-listing marketing only; audited)
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: docId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: The file as an attachment }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /properties/{id}/documents/{docId}:
+    delete:
+      tags: [Documents]
+      summary: Delete an ownership document (primary marketing only)
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: docId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /properties/{id}/owner:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Owner]
+      summary: Owner PII (primary marketing of this listing only)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Owner' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Owner]
+      summary: Update owner (primary marketing of this listing only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateOwner' }
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /properties/{id}/co-listings:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Co-listing]
+      summary: Marketing team (admin, primary marketing, co-listing members)
+      responses:
+        '200':
+          description: Team members; no contact data
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TeamMember' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Co-listing]
+      summary: Add co-listing marketing (admin only)
+      description: Transactional with a property row lock. User must be active with role `sales`; max 2 co-listing (3 total).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MarketingRef' }
+      responses:
+        '201': { $ref: '#/components/responses/Team' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /properties/{id}/transfer-ownership:
+    post:
+      tags: [Co-listing]
+      summary: Transfer primary ownership (admin only, audited)
+      description: |
+        Admin moves primary ownership to another active marketing user (marketing asks the admin, e.g. via WhatsApp).
+        The previous primary becomes a co-listing member, so a free co-listing slot is required when the new primary
+        is not already in the team. Owner data follows the listing to the new primary. Not an edit of listing content.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MarketingRef' }
+      responses:
+        '200': { $ref: '#/components/responses/Team' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /properties/{id}/co-listings/{marketingId}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+      - { name: marketingId, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      tags: [Co-listing]
+      summary: Replace a co-listing marketing (admin only); body holds the replacement
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MarketingRef' }
+      responses:
+        '200': { $ref: '#/components/responses/Team' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+    delete:
+      tags: [Co-listing]
+      summary: Remove a co-listing marketing (admin only; primary cannot be removed)
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /properties/{id}/deal:
+    post:
+      tags: [Deals]
+      summary: Record a deal on a property (admin only)
+      description: |
+        Marketing reports a deal to Admin outside the system; Admin records it here. In one transaction: the
+        property becomes `sold` (sale) or `rented` (rent), a pending commission is created for the property's primary
+        marketing (default percentage) and an audit entry is written. `type` must match the listing's transaction type.
+        A property accepts exactly one outcome (deal or cancellation); a second attempt returns 409.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordDeal' }
+      responses:
+        '201': { $ref: '#/components/responses/Created' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /properties/{id}/cancel:
+    post:
+      tags: [Deals]
+      summary: Record that the owner no longer sells or rents the property (admin only)
+      description: |
+        The property becomes `archived` and disappears from every list (public, marketing and admin lists) and from
+        guest detail views. No commission is created. Returns 409 if the property already has an outcome.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelDeal' }
+      responses:
+        '201': { $ref: '#/components/responses/Created' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /deals:
+    get:
+      tags: [Deals]
+      summary: Deals and cancellations. Marketing → own listings only; admin → all
+      responses: { '200': { $ref: '#/components/responses/Ok' } }
+  /deals/{id}:
+    get:
+      tags: [Deals]
+      summary: Deal or cancellation detail (404 for another marketing's deal)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /commissions:
+    get:
+      tags: [Commissions]
+      summary: Marketing → own commissions; admin → all
+      responses: { '200': { $ref: '#/components/responses/Ok' } }
+  /commissions/{id}:
+    get:
+      tags: [Commissions]
+      summary: Commission detail (404 for another marketing's commission)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { $ref: '#/components/responses/Ok' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Commissions]
+      summary: Override the percentage of a pending commission (admin only); amount is recalculated from the deal price
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [percentage]
+              properties: { percentage: { type: number, minimum: 0, maximum: 100 } }
+      responses: { '200': { $ref: '#/components/responses/Ok' }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' } }
+  /commissions/{id}/status:
+    patch:
+      tags: [Commissions]
+      summary: Mark a pending commission paid or cancelled (admin only; final states are immutable)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties: { status: { type: string, enum: [paid, cancelled] } }
+      responses: { '200': { $ref: '#/components/responses/Ok' }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' } }
+  /users:
+    get: { tags: [Users], summary: List users (admin), responses: { '200': { $ref: '#/components/responses/Ok' } } }
+    post:
+      tags: [Users]
+      summary: Create a Marketing or Admin account (admin only; there is no self-registration)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateUser' }
+      responses: { '201': { $ref: '#/components/responses/Created' }, '409': { $ref: '#/components/responses/Conflict' } }
+  /users/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get: { tags: [Users], summary: User detail (admin), responses: { '200': { $ref: '#/components/responses/Ok' } } }
+    put: { tags: [Users], summary: Update user (admin), requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UserUpdate' } } } }, responses: { '200': { $ref: '#/components/responses/Ok' } } }
+    delete: { tags: [Users], summary: Soft-delete user (admin), responses: { '200': { $ref: '#/components/responses/Ok' } } }
+  /users/{id}/status:
+    patch: { tags: [Users], summary: Activate/deactivate (admin), parameters: [{ $ref: '#/components/parameters/Id' }], requestBody: { required: true, content: { application/json: { schema: { type: object, required: [status], properties: { status: { type: string, enum: [active, inactive] } } } } } }, responses: { '200': { $ref: '#/components/responses/Ok' } } }
+  /users/{id}/role:
+    patch:
+      tags: [Users]
+      summary: Change role (admin); nobody can change their own role
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [role], properties: { role: { type: string, enum: [sales, admin] } } } } }
+      responses: { '200': { $ref: '#/components/responses/Ok' }, '403': { $ref: '#/components/responses/Forbidden' } }
+
+  /audit-logs:
+    get: { tags: [Audit], summary: Audit log (admin), responses: { '200': { $ref: '#/components/responses/Ok' } } }
+  /master-data/provinces:
+    get: { tags: [Master data], security: [], summary: Provinces, responses: { '200': { $ref: '#/components/responses/Ok' } } }
+    post: { tags: [Master data], summary: Create province (admin), responses: { '201': { $ref: '#/components/responses/Created' } } }
+  /master-data/provinces/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    put: { tags: [Master data], summary: Rename province (admin), responses: { '200': { $ref: '#/components/responses/Ok' }, '409': { $ref: '#/components/responses/Conflict' } } }
+    delete: { tags: [Master data], summary: Delete province (admin; 409 while referenced), responses: { '200': { $ref: '#/components/responses/Ok' }, '409': { $ref: '#/components/responses/Conflict' } } }
+  /master-data/cities/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    put: { tags: [Master data], summary: Rename city (admin), responses: { '200': { $ref: '#/components/responses/Ok' }, '409': { $ref: '#/components/responses/Conflict' } } }
+    delete: { tags: [Master data], summary: Delete city (admin; 409 while referenced), responses: { '200': { $ref: '#/components/responses/Ok' }, '409': { $ref: '#/components/responses/Conflict' } } }
+  /master-data/districts:
+    get:
+      tags: [Master data]
+      security: []
+      summary: Districts (filter by city_id)
+      parameters: [{ name: city_id, in: query, schema: { type: string, format: uuid } }]
+      responses: { '200': { $ref: '#/components/responses/Ok' } }
+    post:
+      tags: [Master data]
+      summary: Create district (admin)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [city_id, name], properties: { city_id: { type: string, format: uuid }, name: { type: string } } } } }
+      responses: { '201': { $ref: '#/components/responses/Created' }, '409': { $ref: '#/components/responses/Conflict' }, '422': { $ref: '#/components/responses/Validation' } }
+  /master-data/districts/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    put: { tags: [Master data], summary: Rename district (admin), requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/NameBody' } } } }, responses: { '200': { $ref: '#/components/responses/Ok' }, '409': { $ref: '#/components/responses/Conflict' } } }
+    delete: { tags: [Master data], summary: Delete district (admin; 409 while referenced), responses: { '200': { $ref: '#/components/responses/Ok' }, '409': { $ref: '#/components/responses/Conflict' } } }
+  /master-data/facilities:
+    get: { tags: [Master data], security: [], summary: Facilities, responses: { '200': { $ref: '#/components/responses/Ok' } } }
+    post: { tags: [Master data], summary: Create facility (admin), requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/NameBody' } } } }, responses: { '201': { $ref: '#/components/responses/Created' }, '409': { $ref: '#/components/responses/Conflict' } } }
+  /master-data/facilities/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    put: { tags: [Master data], summary: Rename facility (admin), requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/NameBody' } } } }, responses: { '200': { $ref: '#/components/responses/Ok' }, '409': { $ref: '#/components/responses/Conflict' } } }
+    delete: { tags: [Master data], summary: Delete facility (admin; 409 while referenced), responses: { '200': { $ref: '#/components/responses/Ok' }, '409': { $ref: '#/components/responses/Conflict' } } }
+  /master-data/cities:
+    get: { tags: [Master data], security: [], summary: Cities (filter by province), responses: { '200': { $ref: '#/components/responses/Ok' } } }
+    post: { tags: [Master data], summary: Create city (admin), responses: { '201': { $ref: '#/components/responses/Created' } } }
+
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    Page: { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+  responses:
+    Ok:
+      description: Success envelope
+      content: { application/json: { schema: { $ref: '#/components/schemas/Envelope' } } }
+    Created:
+      description: Created; success envelope with the new resource in `data`
+      content: { application/json: { schema: { $ref: '#/components/schemas/Envelope' } } }
+    Team:
+      description: Updated marketing team
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success: { type: boolean }
+              message: { type: string }
+              data: { type: array, items: { $ref: '#/components/schemas/TeamMember' } }
+    Unauthorized: { description: Missing or invalid token, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Authenticated but not allowed, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Not found or hidden from the caller, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Validation: { description: Validation failed, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    RateLimited: { description: Too many requests }
+  schemas:
+    Envelope:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        message: { type: string }
+        data: {}
+        meta: { $ref: '#/components/schemas/Pagination' }
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        message: { type: string }
+        errors: { type: array, items: { type: object } }
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        total_pages: { type: integer }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+    CreateUser:
+      type: object
+      required: [name, email, password, role]
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+        whatsapp_number: { type: string, description: Normalized to digits with the 62 prefix }
+        password: { type: string }
+        role: { type: string, enum: [sales, admin] }
+    OwnerInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+        private_address: { type: string }
+    Owner:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string }
+        phone: { type: string }
+        private_address: { type: string }
+    UpdateOwner:
+      type: object
+      properties:
+        name: { type: string }
+        email: { type: string }
+        phone: { type: string }
+        private_address: { type: string }
+    CreateProperty:
+      type: object
+      required: [owner, code, name, type, transaction_type]
+      properties:
+        owner: { $ref: '#/components/schemas/OwnerInput' }
+        code: { type: string }
+        name: { type: string }
+        type: { type: string, enum: [house, apartment, shop_house, factory] }
+        transaction_type: { type: string, enum: [sale, rent] }
+        status: { type: string, enum: [draft, available], default: available }
+        price: { type: number, description: Required for sale }
+        rental_price: { type: number, description: Required for rent }
+        description: { type: string }
+        province_id: { type: string, format: uuid }
+        city_id: { type: string, format: uuid, description: Must belong to province_id }
+        district_id: { type: string, format: uuid, description: Must belong to city_id }
+        facility_ids: { type: array, items: { type: string, format: uuid }, description: Master-data facilities; on update the list replaces the current one }
+        general_location: { type: string }
+        block_number: { type: string }
+        cluster_name: { type: string }
+        street_name: { type: string }
+        house_number: { type: string }
+        floor_number: { type: string }
+        room_number: { type: string }
+        latitude: { type: number }
+        longitude: { type: number }
+        land_area: { type: number }
+        building_area: { type: number }
+        floor: { type: integer }
+        bedrooms: { type: integer }
+        bathrooms: { type: integer }
+        year_built: { type: integer }
+      allOf:
+        - $ref: '#/components/schemas/PropertyDetails'
+    PropertyDetails:
+      type: object
+      description: Listing detail fields (D-028), following the reference listing page. All optional.
+      properties:
+        short_description: { type: string, maxLength: 500 }
+        area_label: { type: string, description: 'Display area, e.g. Kota Wisata Cibubur' }
+        sub_district: { type: string, description: Kelurahan }
+        postal_code: { type: string, maxLength: 10 }
+        orientation: { type: string, description: 'Rumah menghadap, e.g. Timur' }
+        maintenance_fee: { type: number, description: Monthly maintenance fee }
+        cert_shm: { type: boolean, description: 'A cert_* flag may be true only for document types that apply to the property type; when true, the matching document can be uploaded. It cannot be set to false while its document exists (409).' }
+        cert_hgb: { type: boolean }
+        cert_imb: { type: boolean }
+        cert_pbb: { type: boolean }
+        cert_girik: { type: boolean }
+        cert_other: { type: boolean }
+        cert_shmsrs: { type: boolean, description: Apartment unit title (SHMSRS) }
+        cert_hgu: { type: boolean, description: Factory only }
+        cert_slf: { type: boolean, description: Apartment, shop and factory }
+        living_rooms: { type: integer }
+        dining_rooms: { type: integer }
+        master_bedrooms: { type: integer }
+        child_bedrooms: { type: integer }
+        other_bedrooms: { type: integer }
+        master_bathrooms: { type: integer }
+        child_bathrooms: { type: integer }
+        other_bathrooms: { type: integer }
+        family_rooms: { type: integer }
+        study_rooms: { type: integer }
+        kitchens: { type: integer }
+        electricity_capacity: { type: string, description: 'e.g. 2200 VA' }
+        air_conditioners: { type: integer }
+        tv_provider: { type: string }
+        water_source: { type: string, description: 'e.g. PAM' }
+        furnishing_status: { type: string, enum: [unfurnished, semi_furnished, furnished] }
+        has_pool: { type: boolean }
+        has_garage: { type: boolean }
+        has_front_yard: { type: boolean }
+        has_back_yard: { type: boolean }
+        has_balcony: { type: boolean }
+        dist_school: { type: integer, description: Meters }
+        dist_bus_terminal: { type: integer, description: Meters }
+        dist_mrt_lrt: { type: integer, description: Meters }
+        dist_toll: { type: integer, description: Meters }
+        dist_hospital: { type: integer, description: Meters }
+        extra_outdoor:
+          type: array
+          maxItems: 10
+          description: Custom outdoor areas besides the has_* flags. Trimmed, blanks and case-insensitive duplicates dropped. Not filterable. On PATCH, omit to keep, [] to clear. Responses always return an array.
+          items: { type: string, minLength: 1, maxLength: 50 }
+        extra_distances:
+          type: array
+          maxItems: 10
+          description: Custom nearby places besides the dist_* fields. Same cleaning and PATCH rules as extra_outdoor.
+          items:
+            type: object
+            required: [name, meters]
+            properties:
+              name: { type: string, minLength: 1, maxLength: 50 }
+              meters: { type: integer, minimum: 0, maximum: 1000000 }
+    RecordDeal:
+      type: object
+      required: [type, price, buyer_name]
+      properties:
+        type: { type: string, enum: [sale, rent], description: Must match the listing's transaction type }
+        price: { type: number, minimum: 0, exclusiveMinimum: true }
+        buyer_name: { type: string, minLength: 2, description: Buyer or tenant name }
+        deal_date: { type: string, format: date, description: Defaults to today }
+        notes: { type: string }
+    CancelDeal:
+      type: object
+      properties:
+        notes: { type: string }
+    NameBody:
+      type: object
+      required: [name]
+      properties: { name: { type: string, minLength: 2 } }
+    UpdateProperty:
+      type: object
+      description: Same fields as CreateProperty except `owner`, `code`, `status`; all optional.
+      additionalProperties: true
+    MarketingRef:
+      type: object
+      required: [marketing_id]
+      properties:
+        marketing_id: { type: string, format: uuid }
+    TeamMember:
+      type: object
+      properties:
+        marketing_id: { type: string, format: uuid }
+        name: { type: string }
+        assignment_type: { type: string, enum: [primary, co_listing] }
+        assigned_at: { type: string, format: date-time }
+    MarketingContact:
+      type: object
+      properties:
+        name: { type: string }
+        whatsapp_number: { type: string }
+        whatsapp_url: { type: string, description: 'wa.me link with URL-encoded prefilled message; marketing number only' }
+    PublicProperty:
+      type: object
+      description: No owner data, no restricted address, no coordinates.
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        type: { type: string }
+        transaction_type: { type: string }
+        status: { type: string }
+        status_badge: { type: string, enum: [SOLD, RENTED] }
+        is_available: { type: boolean, description: true for available/reserved; false for sold/rented/others }
+        price: { type: number }
+        rental_price: { type: number }
+        description: { type: string }
+        province: { type: object, properties: { id: { type: string }, name: { type: string } } }
+        city: { type: object, properties: { id: { type: string }, name: { type: string } } }
+        district: { type: object, properties: { id: { type: string }, name: { type: string } } }
+        facilities: { type: array, items: { type: object, properties: { id: { type: string }, name: { type: string } } } }
+        general_location: { type: string }
+        land_area: { type: number }
+        building_area: { type: number }
+        bedrooms: { type: integer }
+        bathrooms: { type: integer }
+        thumbnail: { type: string }
+        images: { type: array, items: { type: object } }
+        contact: { $ref: '#/components/schemas/MarketingContact' }
+      allOf:
+        - $ref: '#/components/schemas/PropertyDetails'
+    InternalProperty:
+      allOf:
+        - $ref: '#/components/schemas/PublicProperty'
+        - type: object
+          properties:
+            access_level: { type: string, enum: [admin] }
+            marketing_team: { type: array, items: { $ref: '#/components/schemas/TeamMember' } }
+    UserUpdate:
+      type: object
+      required: [name, email]
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+        whatsapp_number: { type: string }
+    PrimaryProperty:
+      allOf:
+        - $ref: '#/components/schemas/PublicProperty'
+        - type: object
+          properties:
+            access_level: { type: string, enum: [primary, co_listing] }
+            address:
+              type: object
+              properties:
+                block_number: { type: string }
+                cluster_name: { type: string }
+                street_name: { type: string }
+                house_number: { type: string }
+                floor_number: { type: string }
+                room_number: { type: string }
+            latitude: { type: number }
+            longitude: { type: number }
+            marketing_team: { type: array, items: { $ref: '#/components/schemas/TeamMember' } }

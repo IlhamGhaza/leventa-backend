@@ -1,0 +1,51 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go
+/vendor/
+go.work
+
+# Environment
+.env
+
+# Local-only notes with test credentials
+*.local.md
+TEST_ACCOUNTS*.md
+
+# Uploads
+/uploads/*
+!/uploads/.gitkeep
+
+# Logs
+/logs/
+*.log
+
+# Private ownership documents
+/documents/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated docs (can be regenerated)
+/docs/docs.go
+/docs/swagger.json
+/docs/swagger.yaml
+
+# Test
+coverage.out
+coverage.html
+
+# Build
+/bin/
+/tmp/
